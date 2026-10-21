@@ -1,0 +1,5 @@
+{
+    "feature_dim": 59, 
+    "hidden_dim": 64, 
+    "out_dim": 64 
+}

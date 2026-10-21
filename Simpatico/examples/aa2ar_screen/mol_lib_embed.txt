@@ -1,0 +1,2 @@
+examples/aa2ar_screen/molecule_library_1.ism
+examples/aa2ar_screen/molecule_library_2.ism

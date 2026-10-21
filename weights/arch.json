@@ -1,0 +1,14 @@
+{
+  "protein": {
+    "kind": "pocket",
+    "feature_dim": 59,
+    "out_dim": 64,
+    "edge_radius": 5.0,
+    "pocket_radius": 6.0
+  },
+  "molecule": {
+    "feature_dim": 33,
+    "max_hops": 1,
+    "out_dim": 64
+  }
+}

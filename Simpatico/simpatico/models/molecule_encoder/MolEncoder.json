@@ -1,0 +1,6 @@
+{
+    "feature_dim": 33, 
+    "hidden_dim":  64, 
+    "out_dim":     64,
+    "edge_dim":    3
+}
