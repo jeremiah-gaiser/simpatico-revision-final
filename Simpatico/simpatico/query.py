@@ -4,29 +4,13 @@ import os
 import pickle
 import sys
 import time
-from glob import glob
-from os import path
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
 
-import faiss
-import numpy as np
 import torch
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import radius
 
-from simpatico import config
-from simpatico.models import MolEncoderDefaults, ProteinEncoderDefaults
-from simpatico.models.molecule_encoder.MolEncoder import MolEncoder
-from simpatico.models.protein_encoder.ProteinEncoder import ProteinEncoder
-from simpatico.utils.app_utils import get_encoder
-from simpatico.utils.data_utils import (
-    ProteinLigandDataLoader,
-    TrainingOutputHandler,
-    concatenate_pyg_files,
-    report_results,
-)
+from simpatico.models import load_encoders
 from simpatico.utils.faiss_utils import VectorDatabase
 from simpatico.utils.mol_utils import get_xyz_from_file, molfile2pyg
 from simpatico.utils.pdb_utils import pdb2pyg
@@ -43,21 +27,30 @@ def add_arguments(parser):
         help="Device to use for training",
     )
     parser.add_argument("-o", "--output-file")
+    # Required: the architecture is read from the arch.json beside the weights (load_encoders),
+    # and the configured default checkpoint is not shipped.
     parser.add_argument('-w', '--weights',
                         type=str,
-                        default=config["default_weights_path"],
-                        help='Path to the weights file')
+                        required=True,
+                        help='Path to the weights file (arch.json must sit beside it)')
 
     parser.add_argument('--save-thresholds',
                         type=str,
-                        default=None)
+                        default=None,
+                        help='Compute per-query thresholds against the FIRST database file, '
+                             'save them here, and exit.')
 
     parser.add_argument('--load-thresholds',
                         type=str,
-                        default=None)
+                        default=None,
+                        help='Score every database file against thresholds saved by --save-thresholds.')
 
-    parser.add_argument('--results-file', type=str,
-                        help='The path for the singular results file (required if one-db is True).')
+    parser.add_argument('--quantile', type=float, default=0.99,
+                        help='Background score quantile for the per-voxel threshold (default 0.99).')
+
+    parser.add_argument('--skip-existing', action='store_true',
+                        help='Skip database files whose results .pkl already exists (for resuming). '
+                             'Requires --load-thresholds so resumed files share thresholds.')
 
     parser.set_defaults(main=main)
 
@@ -69,6 +62,13 @@ if __name__ == "__main__":
 
 def is_binary(tensor: torch.Tensor) -> bool:
     return torch.all((tensor == 0) | (tensor == 1)).item()
+
+def load_graph(graph_file):
+    """Receptor or molecule file -> PyG graph. molfile2pyg returns (batch, smiles) for structure
+    files but a bare batch for .pyg, so unify here."""
+    if graph_file.endswith('.pyg'):
+        return torch.load(graph_file, weights_only=False)
+    return molfile2pyg(graph_file)[0]
 
 def main(args):
     torch.set_grad_enabled(False)
@@ -83,6 +83,9 @@ def main(args):
     logging.basicConfig(**log_config)
     log = logging.getLogger(__name__)
 
+    if args.skip_existing and not args.load_thresholds:
+        sys.exit('--skip-existing requires --load-thresholds.')
+
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     if args.output_dir[-1] != '/':
@@ -94,74 +97,77 @@ def main(args):
 
     with open(args.input_file) as spec_in:
         for line in spec_in:
+            if not line.strip():
+                continue
+
             row_data = [x.strip() for x in line.split(",")]
-
-            if len(row_data) == 3:
-                data_type, graph_file, coord_file = row_data
-                coord_files.append(coord_file)
-            else:
-                data_type, graph_file = row_data
-
-            data_type = data_type.lower()
+            data_type = row_data[0].lower()
 
             if data_type == "q":
-                query_files.append(graph_file)
+                if len(row_data) != 3:
+                    sys.exit(f'query row needs a pocket-coordinate file: {line.strip()}')
+                query_files.append(row_data[1])
+                coord_files.append(row_data[2])
 
             if data_type == "d":
-                db_files.append(graph_file)
+                db_files.append(row_data[1])
+
+    # load_encoders reads arch.json beside the weights: PocketEncoder for the "pocket" kind, and
+    # MolEncoder with the trained max_hops. get_encoder() ignored both, building the voxel
+    # ProteinEncoder (whose state dict does not fit these checkpoints) and max_hops=3.
+    protein_encoder, mol_encoder = load_encoders(args.weights, device=args.device)
+    log.info(f'Loaded {args.weights} ({type(protein_encoder).__name__}, '
+             f'max_hops={mol_encoder.max_hops})')
 
     query_graph_list = []
     pocket_coord_list = []
 
     for pocket_file, coord_file in zip(query_files, coord_files):
-        if pocket_file[-3:] != 'pyg':
-            query_g = pdb2pyg(pocket_file)
-            query_graph_list.append(query_g)
-
-        pocket_coordinates = get_xyz_from_file(coord_file)
-        pocket_coord_list.append(Data(pos=pocket_coordinates))
+        query_g = pdb2pyg(pocket_file) if pocket_file[-3:] != 'pyg' else load_graph(pocket_file)
+        query_graph_list.append(Data(x=query_g.x, pos=query_g.pos.float()))
+        pocket_coord_list.append(Data(pos=get_xyz_from_file(coord_file).float()))
 
     query_batch = Batch.from_data_list(query_graph_list)
     coord_batch = Batch.from_data_list(pocket_coord_list)
 
-    encode_query = is_binary(query_batch.x[:100])
-
-    if encode_query:
-        query_encoder = get_encoder('p', args.weights, args.device)
-        query_encoder.eval()
-
-        with torch.no_grad():
-            query_embeds = query_encoder(query_batch.to(args.device), coord_batch.to(args.device))
+    if is_binary(query_batch.x[:100]):
+        query_embeds = protein_encoder(query_batch.to(args.device), coord_batch.to(args.device))
     else:
         query_embeds = query_batch
 
+    voxel_counts = torch.bincount(query_embeds.batch, minlength=len(query_files)).tolist()
+    log.info(f'{len(query_files)} queries, {sum(voxel_counts)} pocket voxels '
+             f'(min {min(voxel_counts)}, max {max(voxel_counts)} per query)')
+
     if args.load_thresholds:
         score_thresholds = pickle.load(open(args.load_thresholds, 'rb'))
+        if len(score_thresholds[0]) != len(query_files):
+            sys.exit(f'{args.load_thresholds} holds thresholds for {len(score_thresholds[0])} '
+                     f'queries, but {args.input_file} lists {len(query_files)}.')
+        log.info(f'Loaded score thresholds from {args.load_thresholds}')
     else:
         score_thresholds = None
 
     queries = VectorDatabase(query_embeds, score_thresholds)
-    db_encoder = None
 
     for db_file in db_files:
-        log.info(f'Starting {db_file}')
         db_filename = '.'.join(db_file.split('/')[-1].split('.')[:-1])
-        output_filename = db_filename + '_query-results.csv'
+        output_path = args.output_dir + db_filename + '.pkl'
 
-        db_batch, _ = molfile2pyg(db_file)
-        encode_db = is_binary(db_batch.x[:100])
+        if args.skip_existing and os.path.exists(output_path):
+            log.info(f'Skipping {db_file}: {output_path} exists')
+            continue
 
-        if encode_db:
-            if db_encoder is None:
-                db_encoder = get_encoder('m', args.weights, args.device)
+        log.info(f'Starting {db_file}')
+        db_batch = load_graph(db_file)
 
+        if is_binary(db_batch.x[:100]):
             log.info(f'Start encoding')
             db_outs = []
             db_data_loader = DataLoader(db_batch, batch_size=1024, shuffle=False)
 
             for batch in db_data_loader:
-                with torch.no_grad():
-                    embeds = db_encoder(batch.to(args.device))
+                embeds = mol_encoder(batch.to(args.device))
                 batch.x = embeds
                 db_outs += batch.cpu().to_data_list()
 
@@ -173,21 +179,22 @@ def main(args):
         vector_db = VectorDatabase(db_embeds)
 
         if queries.score_thresholds is None or args.save_thresholds:
-            queries.get_score_thresholds(vector_db)
+            queries.get_score_thresholds(vector_db, q=args.quantile)
+            log.info(f'Computed score thresholds against {db_file} (q={args.quantile})')
             if args.save_thresholds:
                 with open(args.save_thresholds, 'wb') as thresholds_out:
-                    pickle.dump(queries.score_thresholds, thresholds_out)
+                    pickle.dump(tuple(x.cpu() for x in queries.score_thresholds), thresholds_out)
 
-                sys.exit(f'Saved query scoring thresholds in {args.save_thresholds}.')
+                log.info(f'Saved query scoring thresholds in {args.save_thresholds}.')
+                return
 
         search_results = vector_db.query(queries)
-        output_csv_content = ''
 
-        for target_idx in range(len(search_results)):
-            for m_score, m_idx in zip(*search_results[target_idx]):
-                output_csv_content += f"{target_idx+1},{m_idx+1},{m_score}\n"
-
-        with open(args.output_dir + output_filename, 'w') as results_out:
-            results_out.write(output_csv_content)
+        # Same format as earlier screens: per query, (sorted non-zero scores, molecule indices
+        # within this file). Written to a temporary name first so a job killed mid-write never
+        # leaves a truncated .pkl for --skip-existing to trust.
+        with open(output_path + '.tmp', 'wb') as results_out:
+            pickle.dump(search_results, results_out)
+        os.replace(output_path + '.tmp', output_path)
 
         log.info(f"Successfully completed {db_file}")

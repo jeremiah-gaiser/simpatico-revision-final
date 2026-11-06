@@ -19,7 +19,8 @@ logging.getLogger("faiss").setLevel(logging.ERROR)
 with pkg_resources.open_text("simpatico", "config.json") as f:
     config = json.load(f)
 
-with pkg_resources.path(
-    "simpatico.models.weights", config["default_weights"]
-) as weight_path:
-    config["default_weights_path"] = str(weight_path)
+# Built as a plain path rather than via pkg_resources.path, which raises on Python 3.9 when the
+# file is absent -- and the default weights are not shipped, so `import simpatico` failed.
+config["default_weights_path"] = os.path.join(
+    os.path.dirname(__file__), "models", "weights", config["default_weights"]
+)
