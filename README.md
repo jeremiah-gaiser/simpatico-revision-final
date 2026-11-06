@@ -21,6 +21,19 @@ scoring protocol, two decontamination tiers.
 | DEKOIS | s30 | 3 | 42, 43, 44 |
 | LIT-PCBA | s90 | 5 | 42, 43, 44, 45, 46 |
 | LIT-PCBA | s30 | 3 | 42, 43, 44 |
+| DUD-E | s_any | 3 | 42, 43, 44 |
+| DEKOIS | s_any | 3 | 42, 43, 44 |
+| LIT-PCBA | s_any | 3 | 42, 43, 44 |
+| DUD-E | t30 | 3 | 42, 43, 44 |
+| DEKOIS | t30 | 3 | 42, 43, 44 |
+| LIT-PCBA | t30 | 3 | 42, 43, 44 |
+
+Filenames are `<benchmark>_<split>_s<seed>_e30.w`. Note `s30` and `t30` differ by one
+character and are **different axes** — sequence identity and ligand similarity. The manifest's
+`split` column is the unambiguous field.
+
+LIT-PCBA s90 ships five seeds because five were trained; the reported figures use the first
+three (42, 43, 44), so that every arm's mean and s.d. come from the same number of runs.
 
 `weights/arch.json` sits beside them and is **required** — `load_encoders` reads it to pick
 the architecture. These checkpoints are `"kind": "pocket"` (PocketEncoder: one node
@@ -64,13 +77,32 @@ under both. The cosine form is kept because it is the geometry the model is trai
 the corpus minus the holdout, minus the shared 200-entry validation list, minus 12 blacklisted
 multi-model structures. From a 19,434-entry corpus:
 
-| benchmark | s90 training | s30 training |
-|---|---|---|
-| LIT-PCBA | 18,948 | 16,787 |
-| DUD-E | 14,742 | 11,318 |
-| DEKOIS | 16,321 | 12,639 |
+| benchmark | s90 | s30 | s_any | t40 | t30 |
+|---|---|---|---|---|---|
+| LIT-PCBA | 18,948 | 16,787 | 14,757 | 16,138 | 9,578 |
+| DUD-E | 14,742 | 11,318 | 10,752 | 11,360 | 4,539 |
+| DEKOIS | 16,321 | 12,639 | 12,245 | 15,221 | 8,666 |
 
 s60 exists upstream but is not included here.
+
+**Two independent axes, not one ladder.** `holdouts/<benchmark>_seq/` holds out by MMseqs2
+sequence identity to a benchmark target chain: `s90`, `s30`, and `s_any`, the last excluding
+every entry with any alignment the aligner reports. That is bounded by the aligner's
+sensitivity (its detection floor sits near 0.21 identity), so it means *no detectable sequence
+homology*, not *no homology*.
+
+`holdouts/<benchmark>_tan/` holds out by ECFP4 Tanimoto (Morgan radius 2, 2048 bits) from the
+crystal ligand to any benchmark active: `t40` at 0.40 and `t30` at 0.30. These remove a
+largely disjoint set of entries from the sequence tiers — Jaccard between `t30` and `s30` is
+0.40 on DUD-E, 0.32 on DEKOIS, 0.13 on LIT-PCBA — so a ligand tier is not a stricter protein
+tier, and the two should not be read as rungs of one ladder.
+
+`unscorable.txt` in each `_tan/` directory lists the 25 corpus entries whose ligand failed to
+parse and so carry no fingerprint. They are excluded from training explicitly: a missing
+similarity would otherwise read as 0.0 and leave them in.
+
+Weights are shipped for `s90`, `s30`, `s_any` and `t30`. `t40` holdout lists are included but
+its checkpoints are not; `t40` is not reported in the paper.
 
 A standing caveat on the s90 vs s30 comparison: a stricter split removes training data as well
 as homology, and at a fixed epoch count that also means fewer gradient steps. DUD-E loses 23.2%
